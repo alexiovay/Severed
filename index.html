@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SEVERED - 2.5D Cyberpunk Action Platformer</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #0A0A0F;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            display: block;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <script>
+        // --- AUDIO SYNTHESIZER ---
+        // A simple tone generator for placeholder sound effects
+        class AudioSynth {
+            constructor() {
+                this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            playTone(freq, type, duration, vol) {
+                if (this.ctx.state === 'suspended') this.ctx.resume();
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+
+                gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+
+                osc.connect(gain);
+                gain.connect(this.ctx.destination);
+
+                osc.start();
+                osc.stop(this.ctx.currentTime + duration);
+            }
+
+            playJump() {
+                this.playTone(400, 'square', 0.2, 0.1);
+                setTimeout(() => this.playTone(600, 'square', 0.2, 0.1), 50);
+            }
+
+            playDash() {
+                this.playTone(800, 'sawtooth', 0.1, 0.05);
+            }
+
+            playAttackLight() {
+                this.playTone(300, 'sawtooth', 0.1, 0.1);
+            }
+
+            playAttackHeavy() {
+                this.playTone(150, 'square', 0.3, 0.2);
+            }
+
+            playHit() {
+                this.playTone(100, 'sawtooth', 0.1, 0.2);
+            }
+
+            playDeath() {
+                this.playTone(50, 'sawtooth', 0.5, 0.3);
+            }
+        }
+
+        const synth = new AudioSynth();
+
+        // --- CONSTANTS & CONFIG ---
+        const GAME_WIDTH = 800;
+        const GAME_HEIGHT = 450;
+        const TILE_SIZE = 32;
+        const COLORS = {
+            bg: 0x0A0A0F,
+            bgFar: 0x111118,
+            bgMid: 0x1A1A24,
+            bgNear: 0x242433,
+            neonBlue: 0x00D4FF,
+            neonPink: 0xFF006E,
+            neonYellow: 0xFFB800,
+            neonRed: 0xFF3333,
+            white: 0xFFFFFF,
+            black: 0x000000,
+            floor: 0x112233
+        };
+
+        // --- PLAYER CLASS ---
+        class Player extends Phaser.Physics.Arcade.Sprite {
+            constructor(scene, x, y) {
+                super(scene, x, y, 'player');
+                scene.add.existing(this);
+                scene.physics.add.existing(this);
+
+                // Physics setup
+                this.setCollideWorldBounds(true);
+                this.setOrigin(0.5, 1); // Origin at bottom center
+                this.body.setSize(20, 40);
+                this.body.setOffset(2, 8);
+
+                // Stats & State
+                this.hp = 100;
+                this.maxHp = 100;
+                this.isDead = false;
+
+                // Movement constants
+                this.SPEED = 200;
+                this.JUMP_VELOCITY = -450;
+                this.WALL_JUMP_X = 250;
+                this.WALL_JUMP_Y = -400;
+
+                // Coyote time & Jump buffering
+                this.coyoteTime = 150; // ms
+                this.lastGroundedTime = 0;
+                this.jumpBufferTime = 100; // ms
+                this.lastJumpPressedTime = -1000;
+
+                // Double jump
+                this.canDoubleJump = false;
+
+                // Dash
+                this.dashSpeed = 600;
+                this.dashDuration = 200; // ms
+                this.dashCooldown = 1000; // ms
+                this.lastDashTime = 0;
+                this.isDashing = false;
+
+                // Combat
+                this.isAttacking = false;
+                this.comboCount = 0;
+                this.comboTimer = null;
+
+                // Input setup
+                this.cursors = scene.input.keyboard.createCursorKeys();
+                this.keys = scene.input.keyboard.addKeys({
+                    jump: Phaser.Input.Keyboard.KeyCodes.UP,
+                    dash: Phaser.Input.Keyboard.KeyCodes.SHIFT,
+                    lightAttack: Phaser.Input.Keyboard.KeyCodes.X,
+                    heavyAttack: Phaser.Input.Keyboard.KeyCodes.C
+                });
+
+                // Attack Hitbox (Group to handle collisions easily)
+                this.attackBox = scene.physics.add.sprite(this.x, this.y, 'attack_box');
+                this.attackBox.body.setAllowGravity(false);
+                this.attackBox.setVisible(false);
+                this.attackBox.setActive(false);
+                this.scene.physics.world.remove(this.attackBox.body);
+            }
+
+            update(time, delta) {
+                if (this.isDead) return;
+
+                // Sync attack box position
+                this.attackBox.x = this.flipX ? this.x - 20 : this.x + 20;
+                this.attackBox.y = this.y - 24;
+
+                const onGround = this.body.onFloor();
+                const onWallLeft = this.body.onWall() && this.body.blocked.left;
+                const onWallRight = this.body.onWall() && this.body.blocked.right;
+                const onWall = onWallLeft || onWallRight;
+
+                // Timers update
+                if (onGround) {
+                    if (time - this.lastGroundedTime > 150) {
+                        // Just landed after a jump/fall (velocity.y was > 0)
+                        this.scene.cameras.main.shake(50, 0.002);
+                    }
+                    this.lastGroundedTime = time;
+                    this.canDoubleJump = true;
+                }
+
+                if (Phaser.Input.Keyboard.JustDown(this.keys.jump) || Phaser.Input.Keyboard.JustDown(this.cursors.up)) {
+                    this.lastJumpPressedTime = time;
+                }
+
+                // --- STATE MACHINE: DASHING ---
+                if (this.isDashing) {
+                    this.body.setVelocityY(0); // No gravity while dashing
+                    // Dash trail effect
+                    if (time % 50 < delta) this.createTrail();
+                    return; // Skip normal movement/actions while dashing
+                }
+
+                // --- DASH TRIGGER ---
+                if (Phaser.Input.Keyboard.JustDown(this.keys.dash) && time > this.lastDashTime + this.dashCooldown) {
+                    this.startDash(time);
+                    return;
+                }
+
+                // --- COMBAT TRIGGER ---
+                if (!this.isAttacking) {
+                    if (Phaser.Input.Keyboard.JustDown(this.keys.lightAttack)) {
+                        this.startLightAttack(time);
+                    } else if (Phaser.Input.Keyboard.JustDown(this.keys.heavyAttack)) {
+                        this.startHeavyAttack(time);
+                    }
+                }
+
+                if (this.isAttacking) {
+                    this.body.setVelocityX(0); // Stop moving while attacking on ground
+                    return; // Lock movement during attack
+                }
+
+                // --- MOVEMENT ---
+                let isMoving = false;
+                if (this.cursors.left.isDown) {
+                    this.body.setVelocityX(-this.SPEED);
+                    this.setFlipX(true);
+                    isMoving = true;
+                } else if (this.cursors.right.isDown) {
+                    this.body.setVelocityX(this.SPEED);
+                    this.setFlipX(false);
+                    isMoving = true;
+                } else {
+                    this.body.setVelocityX(0);
+                }
+
+                // --- WALL SLIDE ---
+                if (onWall && !onGround && isMoving) {
+                    if (this.body.velocity.y > 0) {
+                        this.body.setVelocityY(50); // Sliding down slowly
+                        // Wall slide particles
+                        if (Math.random() > 0.8) this.scene.add.particles(this.flipX ? this.x - 12 : this.x + 12, this.y - 24, 'pixel', {
+                            lifespan: 200, speedY: -50, speedX: 0, tint: COLORS.white, scale: { start: 1, end: 0 }
+                        }).explode(1);
+                    }
+                }
+
+                // --- JUMP LOGIC (Includes Coyote & Buffer) ---
+                const isCoyote = (time - this.lastGroundedTime) <= this.coyoteTime;
+                const isJumpBuffered = (time - this.lastJumpPressedTime) <= this.jumpBufferTime;
+
+                if (isJumpBuffered) {
+                    // Normal or Coyote Jump
+                    if (onGround || isCoyote) {
+                        this.jump(time);
+                    }
+                    // Wall Jump
+                    else if (onWall) {
+                        this.wallJump(onWallLeft);
+                    }
+                    // Double Jump
+                    else if (this.canDoubleJump) {
+                        this.doubleJump();
+                    }
+                }
+            }
+
+            jump(time) {
+                this.body.setVelocityY(this.JUMP_VELOCITY);
+                this.lastJumpPressedTime = 0; // Consume buffer
+                this.lastGroundedTime = 0; // Consume coyote
+                synth.playJump();
+                this.createDust();
+            }
+
+            wallJump(isWallLeft) {
+                this.body.setVelocityY(this.WALL_JUMP_Y);
+                this.body.setVelocityX(isWallLeft ? this.WALL_JUMP_X : -this.WALL_JUMP_X);
+                this.setFlipX(isWallLeft);
+                this.lastJumpPressedTime = 0;
+                this.canDoubleJump = true; // allow double jump after wall jump
+                synth.playJump();
+            }
+
+            doubleJump() {
+                this.body.setVelocityY(this.JUMP_VELOCITY * 0.8);
+                this.canDoubleJump = false;
+                this.lastJumpPressedTime = 0;
+                synth.playJump();
+
+                // Double jump burst
+                this.scene.add.particles(this.x, this.y, 'pixel', {
+                    speed: 50, lifespan: 300, quantity: 10, tint: COLORS.neonBlue, scale: {start: 1, end: 0}
+                }).explode(10);
+            }
+
+            startDash(time) {
+                this.isDashing = true;
+                this.lastDashTime = time;
+                this.body.setVelocityY(0);
+                this.body.setVelocityX(this.flipX ? -this.dashSpeed : this.dashSpeed);
+                synth.playDash();
+
+                this.scene.time.delayedCall(this.dashDuration, () => {
+                    this.isDashing = false;
+                    this.body.setVelocityX(0); // Stop hard after dash
+                });
+            }
+
+            startLightAttack(time) {
+                this.isAttacking = true;
+                this.comboCount++;
+                if (this.comboCount > 3) this.comboCount = 1;
+
+                synth.playAttackLight();
+
+                // Visual attack arc
+                this.createAttackVisual(COLORS.neonBlue, 150);
+                this.activateAttackBox(150, 10); // duration, damage
+
+                // Reset combo timer
+                if (this.comboTimer) this.comboTimer.remove();
+                this.comboTimer = this.scene.time.delayedCall(600, () => { this.comboCount = 0; });
+
+                // End attack state quickly for combo feel
+                this.scene.time.delayedCall(150, () => { this.isAttacking = false; });
+            }
+
+            startHeavyAttack(time) {
+                this.isAttacking = true;
+                this.comboCount = 0; // Break combo
+
+                // Charge up delay
+                this.setTint(COLORS.neonPink);
+
+                this.scene.time.delayedCall(300, () => {
+                    synth.playAttackHeavy();
+                    this.clearTint();
+                    this.createAttackVisual(COLORS.neonPink, 200, 1.5);
+                    this.activateAttackBox(200, 30, true); // heavy flag
+                    this.scene.cameras.main.shake(100, 0.005); // Screen shake
+
+                    this.scene.time.delayedCall(200, () => { this.isAttacking = false; });
+                });
+            }
+
+            activateAttackBox(duration, damage, isHeavy = false) {
+                this.attackBox.setActive(true);
+                this.scene.physics.world.add(this.attackBox.body);
+                this.attackBox.damageValue = damage;
+                this.attackBox.isHeavy = isHeavy;
+                this.attackBox.hitList = []; // Reset hit list for each attack
+
+                this.scene.time.delayedCall(duration, () => {
+                    this.attackBox.setActive(false);
+                    if (this.attackBox.body) this.scene.physics.world.remove(this.attackBox.body);
+                });
+            }
+
+            createAttackVisual(color, duration, scale = 1) {
+                const slash = this.scene.add.graphics();
+                slash.lineStyle(4, color, 1);
+
+                const xOffset = this.flipX ? -20 : 20;
+
+                // Draw a simple arc based on combo
+                slash.beginPath();
+                if (this.comboCount === 1) {
+                    slash.arc(this.x + xOffset, this.y - 24, 20 * scale, Phaser.Math.DegToRad(270), Phaser.Math.DegToRad(90), this.flipX);
+                } else if (this.comboCount === 2) {
+                    slash.arc(this.x + xOffset, this.y - 24, 25 * scale, Phaser.Math.DegToRad(90), Phaser.Math.DegToRad(270), !this.flipX);
+                } else {
+                    slash.arc(this.x + xOffset, this.y - 24, 30 * scale, 0, Math.PI * 2, false); // Spin
+                }
+                slash.strokePath();
+
+                this.scene.tweens.add({
+                    targets: slash,
+                    alpha: 0,
+                    duration: duration,
+                    onComplete: () => slash.destroy()
+                });
+            }
+
+            createTrail() {
+                const trail = this.scene.add.image(this.x, this.y - 24, 'player');
+                trail.setTint(COLORS.neonBlue);
+                trail.setAlpha(0.5);
+                trail.setFlipX(this.flipX);
+
+                this.scene.tweens.add({
+                    targets: trail,
+                    alpha: 0,
+                    scale: 1.2,
+                    duration: 200,
+                    onComplete: () => trail.destroy()
+                });
+            }
+
+            createDust() {
+                this.scene.add.particles(this.x, this.y, 'pixel', {
+                    speedX: { min: -50, max: 50 },
+                    speedY: { min: -10, max: 0 },
+                    lifespan: 200,
+                    quantity: 5,
+                    tint: COLORS.white,
+                    alpha: { start: 0.5, end: 0 }
+                }).explode(5);
+            }
+
+            takeDamage(amount) {
+                if (this.isDashing || this.isDead) return; // i-frames
+
+                this.hp -= amount;
+                synth.playHit();
+
+                // Flash effect and chromatic aberration simulation
+                this.setTint(COLORS.neonRed);
+                this.scene.cameras.main.shake(100, 0.005);
+
+                this.scene.time.delayedCall(100, () => this.clearTint());
+
+                if (this.hp <= 0) {
+                    this.die();
+                }
+            }
+
+            die() {
+                this.isDead = true;
+                synth.playDeath();
+                this.setVisible(false);
+                this.body.setEnable(false);
+
+                // Death explosion
+                this.scene.add.particles(this.x, this.y - 20, 'pixel', {
+                    speed: { min: 100, max: 300 },
+                    lifespan: 1000,
+                    quantity: 100,
+                    tint: [COLORS.neonBlue, COLORS.neonPink, COLORS.white],
+                    scale: { start: 2, end: 0 },
+                    gravityY: 500
+                }).explode(100);
+
+                // Restart scene after delay
+                this.scene.time.delayedCall(2000, () => {
+                    this.scene.scene.restart();
+                });
+            }
+        }
+
+
+        // --- ENEMY CLASS ---
+        class Enemy extends Phaser.Physics.Arcade.Sprite {
+            constructor(scene, x, y) {
+                super(scene, x, y, 'enemy');
+                scene.add.existing(this);
+                scene.physics.add.existing(this);
+
+                this.setCollideWorldBounds(true);
+                this.setOrigin(0.5, 1);
+                this.body.setSize(24, 40);
+                this.body.setOffset(4, 8);
+
+                this.hp = 30;
+                this.speed = 100;
+                this.isDead = false;
+
+                // AI States
+                this.states = { IDLE: 0, PATROL: 1, CHASE: 2, ATTACK: 3, HURT: 4 };
+                this.currentState = this.states.PATROL;
+
+                this.patrolDir = 1;
+                this.patrolTimer = 0;
+
+                this.detectionRadius = 250;
+                this.attackRadius = 40;
+                this.attackCooldown = 1500;
+                this.lastAttackTime = 0;
+            }
+
+            update(time, player) {
+                if (this.isDead) return;
+
+                const distanceToPlayer = Phaser.Math.Distance.Between(this.x, this.y, player.x, player.y);
+                const isPlayerDead = player.isDead;
+
+                // State transitions
+                if (this.currentState !== this.states.HURT && this.currentState !== this.states.ATTACK) {
+                    if (!isPlayerDead && distanceToPlayer < this.attackRadius) {
+                        this.currentState = this.states.ATTACK;
+                    } else if (!isPlayerDead && distanceToPlayer < this.detectionRadius) {
+                        this.currentState = this.states.CHASE;
+                    } else {
+                        this.currentState = this.states.PATROL;
+                    }
+                }
+
+                // State Actions
+                switch (this.currentState) {
+                    case this.states.PATROL:
+                        this.patrol(time);
+                        break;
+                    case this.states.CHASE:
+                        this.chase(player);
+                        break;
+                    case this.states.ATTACK:
+                        this.attack(time, player);
+                        break;
+                }
+            }
+
+            patrol(time) {
+                this.body.setVelocityX(this.speed * 0.5 * this.patrolDir);
+                this.setFlipX(this.patrolDir === -1);
+
+                // Simple turn around logic
+                if (time > this.patrolTimer) {
+                    this.patrolDir *= -1;
+                    this.patrolTimer = time + Phaser.Math.Between(2000, 4000);
+                } else if (this.body.blocked.left || this.body.blocked.right) {
+                    this.patrolDir *= -1;
+                    this.patrolTimer = time + 2000;
+                }
+            }
+
+            chase(player) {
+                if (player.x < this.x) {
+                    this.body.setVelocityX(-this.speed);
+                    this.setFlipX(true);
+                } else {
+                    this.body.setVelocityX(this.speed);
+                    this.setFlipX(false);
+                }
+            }
+
+            attack(time, player) {
+                this.body.setVelocityX(0);
+
+                if (time > this.lastAttackTime + this.attackCooldown) {
+                    this.lastAttackTime = time;
+
+                    // Telegraph
+                    this.setTint(COLORS.neonYellow);
+
+                    this.scene.time.delayedCall(300, () => {
+                        if (this.isDead) return;
+                        this.clearTint();
+
+                        // Attack lunge
+                        this.body.setVelocityX(this.flipX ? -300 : 300);
+                        synth.playAttackLight();
+
+                        // Hurt player if close
+                        const dist = Phaser.Math.Distance.Between(this.x, this.y, player.x, player.y);
+                        if (dist < 50 && !player.isDashing) {
+                            player.takeDamage(20);
+                        }
+
+                        this.scene.time.delayedCall(200, () => {
+                            if (this.isDead) return;
+                            this.body.setVelocityX(0);
+                            this.currentState = this.states.CHASE;
+                        });
+                    });
+                } else if (time > this.lastAttackTime + 500) {
+                    // Back to chase after attack delay
+                    this.currentState = this.states.CHASE;
+                }
+            }
+
+            takeDamage(amount, knockbackForce = 0, knockbackDir = 1) {
+                if (this.isDead) return;
+
+                this.hp -= amount;
+                this.currentState = this.states.HURT;
+                synth.playHit();
+
+                this.setTint(COLORS.white);
+                this.body.setVelocityX(knockbackForce * knockbackDir);
+                this.body.setVelocityY(-100);
+
+                // Impact particles
+                this.scene.add.particles(this.x, this.y - 20, 'pixel', {
+                    speed: 100, lifespan: 300, quantity: 5, tint: COLORS.neonPink, scale: {start: 1, end: 0}
+                }).explode(5);
+
+                this.scene.time.delayedCall(150, () => {
+                    if (this.isDead) return;
+                    this.clearTint();
+                    this.currentState = this.states.CHASE;
+                });
+
+                if (this.hp <= 0) {
+                    this.die();
+                }
+            }
+
+            die() {
+                this.isDead = true;
+                synth.playDeath();
+                this.setVisible(false);
+                this.body.setEnable(false);
+
+                // Blood / Pixel burst
+                this.scene.add.particles(this.x, this.y - 20, 'pixel', {
+                    speed: { min: 50, max: 200 },
+                    lifespan: 800,
+                    quantity: 30,
+                    tint: [COLORS.neonPink, COLORS.neonYellow, COLORS.bgNear],
+                    scale: { start: 1.5, end: 0 },
+                    gravityY: 300
+                }).explode(30);
+
+                // Screen shake on kill
+                this.scene.cameras.main.shake(50, 0.002);
+            }
+        }
+
+        // --- GAME SCENE ---
+        class GameScene extends Phaser.Scene {
+            constructor() {
+                super({ key: 'GameScene' });
+            }
+
+            preload() {
+                // Generate textures using Graphics API
+                this.generateTextures();
+            }
+
+            create() {
+                // Add Parallax Background
+                this.createBackgrounds();
+
+                // Add Rain
+                this.createRain();
+
+                // Create Level
+                this.createLevel();
+
+                // Create Player
+                this.player = new Player(this, 100, 200);
+                this.physics.add.collider(this.player, this.layer);
+
+                // Create Enemies
+                this.enemies = this.add.group();
+                const enemy1 = new Enemy(this, 400, 200);
+                const enemy2 = new Enemy(this, 800, 200);
+                const enemy3 = new Enemy(this, 1500, 200);
+
+                this.enemies.addMultiple([enemy1, enemy2, enemy3]);
+                this.physics.add.collider(this.enemies, this.layer);
+
+                // Combat Overlaps
+                this.physics.add.overlap(this.player.attackBox, this.enemies, this.handleAttackHit, null, this);
+                this.physics.add.overlap(this.player, this.enemies, this.handleEnemyTouch, null, this);
+
+                // Camera setup
+                this.cameras.main.setBackgroundColor(COLORS.bg);
+                this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
+                this.cameras.main.setBounds(0, 0, this.physics.world.bounds.width, this.physics.world.bounds.height);
+
+                // HUD
+                this.createHUD();
+
+                // Scanlines effect (overlaying everything)
+                this.createScanlines();
+            }
+
+            update(time, delta) {
+                // Update HUD
+                if (this.player && !this.player.isDead) {
+                    const hpRatio = Math.max(0, this.player.hp / this.player.maxHp);
+                    this.hpBarFill.scaleX = hpRatio;
+
+                    const dashReady = time > this.player.lastDashTime + this.player.dashCooldown;
+                    this.dashIcon.setTint(dashReady ? COLORS.neonBlue : COLORS.bgMid);
+                }
+
+                if (this.player) this.player.update(time, delta);
+
+                this.enemies.getChildren().forEach(enemy => {
+                    if (enemy.active) {
+                        enemy.update(time, this.player);
+                    }
+                });
+            }
+
+            handleAttackHit(attackBox, enemy) {
+                if (attackBox.active && !enemy.isDead && enemy.currentState !== enemy.states.HURT) {
+                    // Prevent hitting same enemy multiple times per single attack frame
+                    if (!attackBox.hitList) attackBox.hitList = [];
+                    if (attackBox.hitList.includes(enemy)) return;
+
+                    attackBox.hitList.push(enemy);
+
+                    const dir = this.player.flipX ? -1 : 1;
+                    const knockback = attackBox.isHeavy ? 300 : 50;
+
+                    enemy.takeDamage(attackBox.damageValue, knockback, dir);
+
+                    // Add hit freeze effect for game feel
+                    this.scene.pause();
+                    setTimeout(() => { this.scene.resume(); }, attackBox.isHeavy ? 40 : 20);
+                }
+            }
+
+            handleEnemyTouch(player, enemy) {
+                if (!player.isDead && !enemy.isDead && !player.isDashing) {
+                    // Just basic contact damage if they bump into each other and enemy isn't hurting
+                    if (enemy.currentState !== enemy.states.HURT) {
+                        player.takeDamage(10);
+                        // Small knockback
+                        player.body.setVelocityX(enemy.x > player.x ? -200 : 200);
+                        player.body.setVelocityY(-150);
+                    }
+                }
+            }
+
+            // --- PROCEDURAL GRAPHICS ---
+            generateTextures() {
+                const graphics = this.make.graphics({ x: 0, y: 0, add: false });
+
+                // 1. Player Texture
+                graphics.fillStyle(COLORS.neonBlue, 1);
+                graphics.fillRect(0, 0, 24, 48); // Hero placeholder (cyan rectangle)
+                graphics.generateTexture('player', 24, 48);
+                graphics.clear();
+
+                // 2. Enemy Texture
+                graphics.fillStyle(COLORS.neonPink, 1);
+                graphics.fillRect(0, 0, 32, 48); // Enemy placeholder (pink rectangle)
+                graphics.fillStyle(COLORS.white, 1);
+                graphics.fillRect(8, 8, 16, 8); // Eye visor
+                graphics.generateTexture('enemy', 32, 48);
+                graphics.clear();
+
+                // 3. Tile Texture (Neon outline box)
+                graphics.fillStyle(COLORS.bgNear, 1);
+                graphics.fillRect(0, 0, TILE_SIZE, TILE_SIZE);
+                graphics.lineStyle(2, COLORS.neonBlue, 0.5);
+                graphics.strokeRect(0, 0, TILE_SIZE, TILE_SIZE);
+                graphics.generateTexture('tile', TILE_SIZE, TILE_SIZE);
+                graphics.clear();
+
+                // 4. White Pixel (for particles)
+                graphics.fillStyle(COLORS.white, 1);
+                graphics.fillRect(0, 0, 4, 4);
+                graphics.generateTexture('pixel', 4, 4);
+                graphics.clear();
+
+                // 5. Attack Hitbox Texture (invisible or translucent)
+                graphics.fillStyle(COLORS.neonBlue, 0.5);
+                graphics.fillRect(0, 0, 40, 48);
+                graphics.generateTexture('attack_box', 40, 48);
+                graphics.clear();
+            }
+
+            createBackgrounds() {
+                const width = this.sys.game.config.width;
+                const height = this.sys.game.config.height;
+
+                // Far layer (Skyline)
+                this.bgFar = this.add.graphics();
+                this.bgFar.setScrollFactor(0.1);
+                this.bgFar.fillStyle(COLORS.bgFar, 1);
+                for (let i = 0; i < 20; i++) {
+                    let w = Phaser.Math.Between(50, 150);
+                    let h = Phaser.Math.Between(100, 300);
+                    let x = i * 100;
+                    this.bgFar.fillRect(x, height - h, w, h);
+                    // Add random lit neon windows
+                    if (Math.random() > 0.5) {
+                        this.bgFar.fillStyle(COLORS.neonYellow, 0.5);
+                        this.bgFar.fillRect(x + 10, height - h + 20, 10, 20);
+                        this.bgFar.fillStyle(COLORS.bgFar, 1);
+                    }
+                }
+
+                // Mid layer (Buildings)
+                this.bgMid = this.add.graphics();
+                this.bgMid.setScrollFactor(0.3);
+                this.bgMid.fillStyle(COLORS.bgMid, 1);
+                for (let i = 0; i < 30; i++) {
+                    let w = Phaser.Math.Between(60, 120);
+                    let h = Phaser.Math.Between(50, 200);
+                    let x = i * 80;
+                    this.bgMid.fillRect(x, height - h, w, h);
+                }
+
+                // Near layer (Structures)
+                this.bgNear = this.add.graphics();
+                this.bgNear.setScrollFactor(0.6);
+                this.bgNear.fillStyle(COLORS.bgNear, 1);
+                for (let i = 0; i < 40; i++) {
+                    let w = Phaser.Math.Between(40, 80);
+                    let h = Phaser.Math.Between(20, 100);
+                    let x = i * 60;
+                    this.bgNear.fillRect(x, height - h, w, h);
+                }
+            }
+
+            createHUD() {
+                // Fixed to camera
+                this.hpBarBg = this.add.graphics();
+                this.hpBarBg.setScrollFactor(0);
+                this.hpBarBg.fillStyle(COLORS.bgMid, 0.8);
+                this.hpBarBg.fillRect(20, 20, 200, 20);
+                this.hpBarBg.lineStyle(2, COLORS.neonPink, 1);
+                this.hpBarBg.strokeRect(20, 20, 200, 20);
+
+                this.hpBarFill = this.add.graphics({ x: 20, y: 20 });
+                this.hpBarFill.setScrollFactor(0);
+                this.hpBarFill.fillStyle(COLORS.neonPink, 1);
+                this.hpBarFill.fillRect(0, 0, 200, 20);
+
+                const dashGraphics = this.make.graphics({ x: 0, y: 0, add: false });
+                dashGraphics.fillStyle(COLORS.white, 1);
+                dashGraphics.fillRect(0, 0, 20, 20);
+                dashGraphics.lineStyle(2, COLORS.neonBlue, 1);
+                dashGraphics.strokeRect(0, 0, 20, 20);
+                dashGraphics.generateTexture('dash_icon', 20, 20);
+                dashGraphics.clear();
+
+                this.dashIcon = this.add.image(240, 30, 'dash_icon');
+                this.dashIcon.setScrollFactor(0);
+
+                // Instructions
+                const style = { font: '12px Courier', fill: '#00D4FF' };
+                this.add.text(20, 45, 'ARROWS/LEFT/RIGHT: Move', style).setScrollFactor(0);
+                this.add.text(20, 60, 'UP: Jump/Double Jump/Wall Jump', style).setScrollFactor(0);
+                this.add.text(20, 75, 'SHIFT: Dash  X: Light Attack  C: Heavy Attack', style).setScrollFactor(0);
+            }
+
+            createScanlines() {
+                const scanlines = this.add.graphics();
+                scanlines.fillStyle(0x000000, 0.2);
+                for (let i = 0; i < GAME_HEIGHT; i += 4) {
+                    scanlines.fillRect(0, i, GAME_WIDTH, 2);
+                }
+                scanlines.setScrollFactor(0);
+                scanlines.setDepth(100); // Draw over everything
+            }
+
+            createRain() {
+                this.rainParticles = this.add.particles(0, 0, 'pixel', {
+                    x: { min: 0, max: 2000 }, // Spread across level
+                    y: 0,
+                    lifespan: 1500,
+                    speedY: { min: 400, max: 600 },
+                    speedX: { min: -50, max: 50 },
+                    scaleY: { min: 2, max: 5 }, // Stretch to look like rain
+                    scaleX: 0.5,
+                    quantity: 4,
+                    blendMode: 'ADD',
+                    tint: COLORS.neonBlue,
+                    alpha: { start: 0.5, end: 0 }
+                });
+                this.rainParticles.setScrollFactor(0.8);
+            }
+
+            createLevel() {
+                // Procedural tilemap generation
+                const levelWidth = 100; // Longer level
+                const levelHeight = 20; // tiles
+
+                // 0 = empty, 1 = solid tile
+                let levelData = [];
+                for (let y = 0; y < levelHeight; y++) {
+                    let row = [];
+                    for (let x = 0; x < levelWidth; x++) {
+                        // Floor
+                        if (y >= levelHeight - 3) {
+                            row.push(1);
+                        }
+                        // Walls at edges
+                        else if (x === 0 || x === levelWidth - 1) {
+                            row.push(1);
+                        }
+                        // Some platforms and a wall for wall-jumping
+                        else if (
+                            (y === 12 && x > 10 && x < 15) ||
+                            (y === 9 && x > 20 && x < 25) ||
+                            (y === 14 && x === 30) ||
+                            (y >= 8 && y < 14 && x === 35) || // Tall wall
+                            (y === 10 && x > 40 && x < 50)
+                        ) {
+                            row.push(1);
+                        }
+                        // Gaps in floor
+                        else if (y >= levelHeight - 3 && (x > 15 && x < 18)) {
+                            // Fix floor gap so it's actually empty
+                            if (y >= levelHeight - 3) row[row.length - 1] = 0;
+                        }
+                        else {
+                            row.push(0);
+                        }
+                    }
+                    levelData.push(row);
+                }
+
+                // Force gap fix (overriding floor logic above)
+                for (let y = levelHeight - 3; y < levelHeight; y++) {
+                    for (let x = 16; x < 19; x++) {
+                        levelData[y][x] = 0;
+                    }
+                    for (let x = 38; x < 41; x++) {
+                        levelData[y][x] = 0;
+                    }
+                }
+
+                const map = this.make.tilemap({ data: levelData, tileWidth: TILE_SIZE, tileHeight: TILE_SIZE });
+                const tileset = map.addTilesetImage('tile');
+                this.layer = map.createLayer(0, tileset, 0, 0);
+                this.layer.setCollisionByExclusion([0]);
+
+                this.physics.world.bounds.width = levelWidth * TILE_SIZE;
+                this.physics.world.bounds.height = levelHeight * TILE_SIZE;
+            }
+        }
+
+        const config = {
+            type: Phaser.AUTO,
+            width: GAME_WIDTH,
+            height: GAME_HEIGHT,
+            backgroundColor: '#0A0A0F',
+            pixelArt: true,
+            physics: {
+                default: 'arcade',
+                arcade: {
+                    gravity: { y: 1000 },
+                    debug: false
+                }
+            },
+            scene: [GameScene]
+        };
+
+        const game = new Phaser.Game(config);
+    </script>
+</body>
+</html>
