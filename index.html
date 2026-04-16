@@ -862,7 +862,8 @@
                     for (let x = 0; x < levelWidth; x++) {
                         // Floor
                         if (y >= levelHeight - 3) {
-                            row.push(1);
+                            const isGap = (x >= 16 && x <= 18) || (x >= 38 && x <= 40);
+                            row.push(isGap ? 0 : 1);
                         }
                         // Walls at edges
                         else if (x === 0 || x === levelWidth - 1) {
@@ -878,11 +879,6 @@
                         ) {
                             row.push(1);
                         }
-                        // Gaps in floor
-                        else if (y >= levelHeight - 3 && (x > 15 && x < 18)) {
-                            // Fix floor gap so it's actually empty
-                            if (y >= levelHeight - 3) row[row.length - 1] = 0;
-                        }
                         else {
                             row.push(0);
                         }
@@ -890,15 +886,6 @@
                     levelData.push(row);
                 }
 
-                // Force gap fix (overriding floor logic above)
-                for (let y = levelHeight - 3; y < levelHeight; y++) {
-                    for (let x = 16; x < 19; x++) {
-                        levelData[y][x] = 0;
-                    }
-                    for (let x = 38; x < 41; x++) {
-                        levelData[y][x] = 0;
-                    }
-                }
 
                 const map = this.make.tilemap({ data: levelData, tileWidth: TILE_SIZE, tileHeight: TILE_SIZE });
                 const tileset = map.addTilesetImage('tile');
